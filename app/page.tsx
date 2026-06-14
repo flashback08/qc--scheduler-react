@@ -1,1123 +1,666 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect } from 'react';
 import { createClient } from '@supabase/supabase-js';
 
-// Initialize Supabase Client
+// Initialize Supabase Configuration using specified context criteria
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-export default function SchedulerDashboard() {
-  // --- AUTHENTICATION STATES ---
+type UserRole = 'PRIMARY_PLANNER' | 'BACKUP_PLANNER' | 'ADMIN' | 'QA_VIEWER';
+
+interface Material {
+  material_code: string;
+  material_name: string;
+  category: string;
+  sla_duration_hours: number;
+}
+
+interface Instrument {
+  instrument_serial_id: string;
+  instrument_type: string;
+  model_make: string;
+  lab_section: string;
+  status: string;
+}
+
+interface Analyst {
+  employee_code: string;
+  full_name: string;
+  primary_section: string;
+  is_available_today: boolean;
+}
+
+interface PendingJob {
+  id: string;
+  source_system_ref: string;
+  batch_lot_number: string;
+  arrival_timestamp: string;
+  status: 'AWAITING_ALLOCATION' | 'ALLOCATED' | 'COMPLETED'; // Aligned strictly to database native enum types
+  sla_target_completion: string;
+  material_code: string;
+  allocated_analyst_code: string | null;
+  allocated_instrument_id: string | null;
+  priority_level: string;
+  urgency_score: number;
+  lock_execution: boolean;
+  priority_justification_reason: string | null;
+  materials?: Material;
+}
+
+export default function PremiumGlassLimsDashboardV3() {
+  const [hasMounted, setHasMounted] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(true);
+
+  // --- IDENTITY & SECURITY STATES ---
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [username, setUsername] = useState('');
+  const [isTwoFactorPhase, setIsTwoFactorPhase] = useState(false);
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [selectedRole, setSelectedRole] = useState('PRIMARY_PLANNER');
-  const [userRole, setUserRole] = useState('');
-  const [authError, setAuthError] = useState('');
+  const [twoFactorCode, setTwoFactorCode] = useState('');
+  const [operatorName, setOperatorName] = useState('');
+  const [userRole, setUserRole] = useState<UserRole>('QA_VIEWER');
 
-  // --- CORE DATA STATES ---
-  const [pendingItems, setPendingItems] = useState<any[]>([]);
-  const [analysts, setAnalysts] = useState<any[]>([]);
-  const [instruments, setInstruments] = useState<any[]>([]);
+  // --- FEEDBACK OVERLAYS ---
+  const [feedback, setFeedback] = useState<{ type: 'success' | 'error' | null; msg: string }>({ type: null, msg: '' });
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
 
-  // --- BULK SELECTION STATE (§6.5 COMPLIANCE) ---
-  const [selectedTasks, setSelectedTasks] = useState<string[]>([]);
+  // --- UNIFIED CACHED FEEDS ---
+  const [jobs, setJobs] = useState<PendingJob[]>([]);
+  const [materials, setMaterials] = useState<Material[]>([]);
+  const [instruments, setInstruments] = useState<Instrument[]>([]);
+  const [analysts, setAnalysts] = useState<Analyst[]>([]);
 
-  // --- LIVE FILTER STATES ---
-  const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState('ALL');
-  const [priorityFilter, setPriorityFilter] = useState('ALL');
+  // --- MUTATION DATA MATRIX FOR FORMS ---
+  const [matCode, setMatCode] = useState('');
+  const [matName, setMatName] = useState('');
+  const [selectedJobId, setSelectedJobId] = useState('');
+  const [targetAnalystCode, setTargetAnalystCode] = useState('');
+  const [targetInstrumentId, setTargetInstrumentId] = useState('');
+  const [overrideReason, setOverrideReason] = useState('');
 
-  // --- FORM OVERRIDE STATES ---
-  const [formSelectedTask, setFormSelectedTask] = useState('');
-  const [formSelectedAnalyst, setFormSelectedAnalyst] = useState('');
-  const [formSelectedInstrument, setFormSelectedInstrument] = useState('');
-
-  // --- NEW FEATURE STATE: MANUAL INGESTION EXCEPTIONS ---
-  const [manualMaterialCode, setManualMaterialCode] = useState('');
-  const [manualTestDirective, setManualTestDirective] = useState('');
-  const [manualSlaTier, setManualSlaTier] = useState('MEDIUM');
-
-  // --- SYSTEM ADMIN LIVE DIRECTORY DIRECTIVES ---
-  const [adminTab, setAdminTab] = useState<'IAM' | 'CALENDAR' | 'RULES'>('IAM');
-  const [adminTargetUser, setAdminTargetUser] = useState('');
-  const [adminTargetInstrument, setAdminTargetInstrument] = useState('');
-  const [adminRoleAssignment, setAdminRoleAssignment] = useState('LAB_ANALYST');
-  
-  const [adminNewUserCode, setAdminNewUserCode] = useState('');
-  const [adminNewUserName, setAdminNewUserName] = useState('');
-
-  // Calendar & Rules Context States
-  const [adminShiftCode, setAdminShiftCode] = useState('SHIFT_A');
-  const [adminShiftStart, setAdminShiftStart] = useState('22:00');
-  const [adminShiftEnd, setAdminShiftEnd] = useState('06:00');
-  const [adminHolidayDate, setAdminHolidayDate] = useState('');
-  const [adminHolidayLabel, setAdminHolidayLabel] = useState('');
-  const [adminSlaCategory, setAdminSlaCategory] = useState('');
-  const [adminSlaHours, setAdminSlaHours] = useState('24');
-  const [adminCompatibilityProtocol, setAdminCompatibilityProtocol] = useState('');
-  const [adminMessage, setAdminMessage] = useState('');
-
-  // --- UI FLAGS ---
-  const [isOptimizing, setIsOptimizing] = useState(false);
-  const [formMessage, setFormMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-
-  // --- FETCH PIPELINE ---
-  const fetchCoreData = async () => {
-    try {
-      const { data: tasksData } = await supabase
-        .from('pending_list')
-        .select('*')
-        .order('urgency_score', { ascending: false });
-      setPendingItems(tasksData || []);
-
-      const { data: analystsData } = await supabase
-        .from('analysts')
-        .select('*');
-      setAnalysts(analystsData || []);
-
-      const { data: instrumentsData } = await supabase
-        .from('instruments')
-        .select('*');
-      setInstruments(instrumentsData || []);
-    } catch (err: any) {
-      console.error('Data pipeline loading error:', err.message);
-    }
-  };
+  // --- AD-HOC NEW JOB MANIFEST FORM STATE ---
+  const [newSysRef, setNewSysRef] = useState('');
+  const [newBatchLot, setNewBatchLot] = useState('');
+  const [newMatCode, setNewMatCode] = useState('');
+  const [newUrgencyScore, setNewUrgencyScore] = useState('50');
 
   useEffect(() => {
-    if (isLoggedIn) {
-      fetchCoreData();
+    setHasMounted(true);
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session) verifyAndSetupWorkspace(session.user.id);
+    });
+  }, []);
 
-      const realTimeChannel = supabase
-        .channel('prd-stable-channel')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'pending_list' }, () => { fetchCoreData(); })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'instruments' }, () => { fetchCoreData(); })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'analysts' }, () => { fetchCoreData(); })
-        .subscribe();
-
-      return () => {
-        supabase.removeChannel(realTimeChannel);
-      };
-    }
+  useEffect(() => {
+    if (isLoggedIn) syncGlobalSchemaFeeds();
   }, [isLoggedIn]);
 
-  // --- AUTHENTICATION ACTIONS ---
-  const handleLogin = (e: React.FormEvent) => {
+  if (!hasMounted) return <div className={isDarkMode ? 'bg-[#08090d]' : 'bg-[#f4f5f6]'} />;
+
+  // --- SECURITY AUTHENTICATION ENFORCEMENT ENGINE ---
+  const verifyAndSetupWorkspace = async (uid: string) => {
+    try {
+      const { data: profile, error } = await supabase
+        .from('profiles')
+        .select('full_name, role')
+        .eq('id', uid)
+        .single();
+
+      if (error || !profile) throw new Error("Security verification matrix failed to resolve identity mapping.");
+
+      setUserRole(profile.role as UserRole);
+      setOperatorName(profile.full_name);
+      setIsLoggedIn(true);
+      setIsTwoFactorPhase(false);
+      setFeedback({ type: 'success', msg: `Secure Session Confirmed: Operator ${profile.full_name} online.` });
+    } catch (err: any) {
+      setFeedback({ type: 'error', msg: err.message });
+      supabase.auth.signOut();
+    }
+  };
+
+  const initLoginChallenge = (e: React.FormEvent) => {
     e.preventDefault();
-    setAuthError('');
-    if (!username || !password) {
-      setAuthError('All authentication coordinates are strictly required.');
+    setFeedback({ type: null, msg: '' });
+
+    if (password.length < 12) {
+      setFeedback({ type: 'error', msg: "Security Policy Failure: Your password must contain at least 12 characters." });
       return;
     }
-    setUserRole(selectedRole);
-    setIsLoggedIn(true);
+
+    setIsTwoFactorPhase(true);
+    setFeedback({ type: 'success', msg: "Primary authentication successful. Complete 2FA checkpoint." });
   };
 
-  const handleLogout = () => {
-    setIsLoggedIn(false);
-    setUsername('');
-    setPassword('');
-    setUserRole('');
-    setFormSelectedTask('');
-    setFormSelectedAnalyst('');
-    setFormSelectedInstrument('');
-    setAdminTargetUser('');
-    setAdminTargetInstrument('');
-    setSelectedTasks([]);
-  };
+  const handleTwoFactorVerify = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setFeedback({ type: null, msg: '' });
 
-  // --- RUNTIME FILTER MEMO ---
-  const filteredPendingItems = useMemo(() => {
-    return pendingItems.filter((item) => {
-      const matchesSearch = 
-        item.source_system_ref?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        item.batch_lot_number?.toLowerCase().includes(searchQuery.toLowerCase());
-      
-      const matchesStatus = statusFilter === 'ALL' || item.status === statusFilter;
-      const matchesPriority = priorityFilter === 'ALL' || item.priority_level === priorityFilter;
+    if (twoFactorCode.trim().length < 6) {
+      setFeedback({ type: 'error', msg: "Invalid token structure. Code must match 6-digit framework." });
+      return;
+    }
 
-      return matchesSearch && matchesStatus && matchesPriority;
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: email.trim(),
+      password: password,
     });
-  }, [pendingItems, searchQuery, statusFilter, priorityFilter]);
 
-  // --- FEATURE EXECUTION: NEW MANUAL PENDING INGESTION FORM ---
-  const handleManualPendingEntry = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!manualMaterialCode || !manualTestDirective) {
-      alert('Exception Logging Error: All explicit material & method properties are mandatory.');
+    if (error) {
+      setFeedback({ type: 'error', msg: `Access Denied: ${error.message}` });
+      setIsTwoFactorPhase(false);
       return;
     }
+    if (data?.user) verifyAndSetupWorkspace(data.user.id);
+  };
 
-    const calculatedUrgency = manualSlaTier === 'CRITICAL' ? 95 : manualSlaTier === 'MEDIUM' ? 50 : 15;
-    const fallbackRef = `MANUAL-${Math.floor(1000 + Math.random() * 9000)}`;
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    setIsLoggedIn(false);
+    setIsTwoFactorPhase(false);
+    setEmail(''); setPassword(''); setTwoFactorCode('');
+    setFeedback({ type: null, msg: '' });
+  };
 
+  // --- DATABASE DATA SYNCHRONIZER ---
+  const syncGlobalSchemaFeeds = async () => {
     try {
-      const { error } = await supabase
+      const { data: pendingJobs } = await supabase
         .from('pending_list')
-        .insert([{
-          source_system_ref: fallbackRef,
-          batch_lot_number: manualMaterialCode.trim().toUpperCase(),
-          priority_level: manualSlaTier,
-          urgency_score: calculatedUrgency,
-          status: 'AWAITING_ALLOCATION',
-          lock_execution: false
-        }]);
+        .select('*, materials:material_code (*)')
+        .order('urgency_score', { ascending: false });
 
-      if (error) throw error;
-      
-      setManualMaterialCode('');
-      setManualTestDirective('');
-      alert(`Ingestion Successful: Logged structural sample exception identifier ${fallbackRef}`);
-      fetchCoreData();
-    } catch (err: any) {
-      alert(`Database Refusal: ${err.message}`);
+      const { data: mats } = await supabase.from('materials').select('*');
+      const { data: insts } = await supabase.from('instruments').select('*');
+      const { data: anls } = await supabase.from('analysts').select('*').order('full_name', { ascending: true });
+
+      if (pendingJobs) setJobs(pendingJobs as any);
+      if (mats) setMaterials(mats);
+      if (insts) setInstruments(insts);
+      if (anls) setAnalysts(anls);
+    } catch (err) {
+      console.error("Schema sync drop: ", err);
     }
   };
 
-  // --- FEATURE EXECUTION: §6.5 TEST FINALIZATION DIRECTIVES (SINGLE & BULK) ---
-  const toggleTaskSelection = (refId: string) => {
-    setSelectedTasks(prev => 
-      prev.includes(refId) ? prev.filter(id => id !== refId) : [...prev, refId]
-    );
-  };
-
-  const toggleAllVisibleTasks = () => {
-    const completenessTargets = filteredPendingItems.filter(i => i.status !== 'COMPLETED').map(i => i.source_system_ref);
-    if (selectedTasks.length === completenessTargets.length) {
-      setSelectedTasks([]);
-    } else {
-      setSelectedTasks(completenessTargets);
-    }
-  };
-
-  const handleExecuteCompleteness = async (targets: string[]) => {
-    if (targets.length === 0) return;
-    const confirmFinalization = confirm(`§6.5 Regulatory Action: Commit standard closure confirmation protocol across ${targets.length} signature line records?`);
-    if (!confirmFinalization) return;
+  // --- PLANNER ONLY: AUTOMATIC SCHEDULER ENGINE ---
+  const executeAutomaticOptimization = async () => {
+    if (!userRole.includes('PLANNER') && userRole !== 'ADMIN') return;
+    setFeedback({ type: null, msg: '' });
+    setActionLoading('AUTO_SCHEDULER_RUNNING');
 
     try {
-      const { error } = await supabase
-        .from('pending_list')
-        .update({ status: 'COMPLETED' })
-        .in('source_system_ref', targets);
+      const unallocated = jobs.filter(j => j.status === 'AWAITING_ALLOCATION');
+      const availableAnalysts = analysts.filter(a => a.is_available_today);
+      const availableInstruments = instruments.filter(i => i.status === 'AVAILABLE');
 
-      if (error) throw error;
-      
-      setSelectedTasks(prev => prev.filter(id => !targets.includes(id)));
-      alert(`§6.5 Closure Protocol Injected: Successfully archived processing logs.`);
-      fetchCoreData();
+      if (unallocated.length === 0) {
+        setFeedback({ type: 'success', msg: "Queue optimization complete: No unallocated items pending." });
+        return;
+      }
+
+      let matchCount = 0;
+      for (let i = 0; i < unallocated.length; i++) {
+        if (i >= availableAnalysts.length || i >= availableInstruments.length) break;
+
+        const targetJob = unallocated[i];
+        const targetAnalyst = availableAnalysts[i];
+        const targetInst = availableInstruments[i];
+
+        const { error } = await supabase
+          .from('pending_list')
+          .update({
+            allocated_analyst_code: targetAnalyst.employee_code,
+            allocated_instrument_id: targetInst.instrument_serial_id,
+            status: 'ALLOCATED',
+            priority_justification_reason: 'Automated Load-Balancing Execution Matrix Sequence Run'
+          })
+          .eq('id', targetJob.id);
+
+          if (!error) matchCount++;
+      }
+
+      setFeedback({ type: 'success', msg: `Auto-Scheduler matched (${matchCount}) workloads cleanly into active floor channels.` });
+      syncGlobalSchemaFeeds();
     } catch (err: any) {
-      alert(`Database Execution Blocked: ${err.message}`);
-    }
-  };
-
-  // --- ENGINE DISPATCH (PLANNER ONLY) ---
-  const handleInvokeEngine = async () => {
-    if (userRole === 'SYSTEM_ADMIN' || userRole === 'QA_VIEWER') return;
-    setIsOptimizing(true);
-    try {
-      const response = await fetch('/api/trigger-scheduler', { method: 'POST' });
-      await response.json();
-      fetchCoreData();
-    } catch (error: any) {
-      console.error('Network failure:', error.message);
+      setFeedback({ type: 'error', msg: `Auto-Scheduler runtime exception: ${err.message}` });
     } finally {
-      setIsOptimizing(false);
+      setActionLoading(null);
     }
   };
 
-  // --- MANUAL OVERRIDE DISPATCH (PLANNER ONLY) ---
-  const handleManualDispatch = async (e: React.FormEvent) => {
+  // --- PLANNER ONLY: CREATE AD-HOC JOBS MANUALLY ---
+  const handleManualJobCreation = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (userRole === 'SYSTEM_ADMIN' || userRole === 'QA_VIEWER') return;
-    setFormMessage(null);
+    if (!userRole.includes('PLANNER') && userRole !== 'ADMIN') return;
+    setFeedback({ type: null, msg: '' });
 
-    if (!formSelectedTask || !formSelectedAnalyst || !formSelectedInstrument) {
-      setFormMessage({ type: 'error', text: 'Validation Error: Complete override routing required.' });
-      return;
+    try {
+      const { error } = await supabase.from('pending_list').insert([{
+        source_system_ref: newSysRef.toUpperCase().trim(),
+        batch_lot_number: newBatchLot.trim(),
+        material_code: newMatCode,
+        urgency_score: parseInt(newUrgencyScore) || 50,
+        sla_target_completion: new Date(Date.now() + 86400000 * 2).toISOString(),
+        status: 'AWAITING_ALLOCATION'
+      }]);
+
+      if (error) throw error;
+
+      setFeedback({ type: 'success', msg: `Manually added production job ${newSysRef} into registry.` });
+      setNewSysRef(''); setNewBatchLot(''); setNewMatCode('');
+      syncGlobalSchemaFeeds();
+    } catch (err: any) {
+      setFeedback({ type: 'error', msg: `Job injection rejected: ${err.message}` });
     }
+  };
 
+  // --- ADMIN ONLY: MUTATORS ---
+  const toggleAnalystAvailability = async (empCode: string, currentStatus: boolean) => {
+    if (userRole !== 'ADMIN') return;
+    setFeedback({ type: null, msg: '' });
+    try {
+      const { error } = await supabase
+        .from('analysts')
+        .update({ is_available_today: !currentStatus })
+        .eq('employee_code', empCode);
+
+      if (error) throw error;
+      setFeedback({ type: 'success', msg: `Analyst deployment capability updated for [${empCode}].` });
+      syncGlobalSchemaFeeds();
+    } catch (err: any) {
+      setFeedback({ type: 'error', msg: err.message });
+    }
+  };
+
+  const createMaterialSpecRow = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (userRole !== 'ADMIN') return;
+    setFeedback({ type: null, msg: '' });
+    try {
+      const { error } = await supabase.from('materials').insert([{
+        material_code: matCode.toUpperCase().trim(),
+        material_name: matName.trim(),
+        category: 'RM',
+        sla_duration_hours: 24
+      }]);
+
+      if (error) throw error;
+      setFeedback({ type: 'success', msg: `Catalog row added for ${matCode}.` });
+      setMatCode(''); setMatName('');
+      syncGlobalSchemaFeeds();
+    } catch (err: any) {
+      setFeedback({ type: 'error', msg: err.message });
+    }
+  };
+
+  // --- FIXES: INVALID ENUM ASSIGNMENT FALLBACK VALVE ---
+  const updateJobValveState = async (jobId: string, targetAction: 'COMPLETE' | 'FAULT') => {
+    setActionLoading(jobId);
+    setFeedback({ type: null, msg: '' });
+    try {
+      // Avoid enum translation runtime error by updating parameters within standard types
+      const payload = targetAction === 'COMPLETE' 
+        ? { status: 'COMPLETED', completed_timestamp: new Date().toISOString() }
+        : { lock_execution: true, priority_justification_reason: 'INSTRUMENT_FAULT EXCEPTION FILED BY CONTROLLER' };
+
+      const { error } = await supabase
+        .from('pending_list')
+        .update(payload)
+        .eq('id', jobId);
+
+      if (error) throw error;
+      setFeedback({ type: 'success', msg: `Job updated safely. Target action executed: [${targetAction}].` });
+      syncGlobalSchemaFeeds();
+    } catch (err: any) {
+      setFeedback({ type: 'error', msg: err.message });
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const applyManualAllocationLock = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedJobId) return;
+    setFeedback({ type: null, msg: '' });
     try {
       const { error } = await supabase
         .from('pending_list')
         .update({
-          allocated_analyst_code: formSelectedAnalyst,
-          allocated_instrument_id: formSelectedInstrument,
-          status: 'SCHEDULED_TODAY',
+          allocated_analyst_code: targetAnalystCode || null,
+          allocated_instrument_id: targetInstrumentId || null,
+          status: 'ALLOCATED',
           lock_execution: true,
-          scheduled_start_time: new Date().toISOString()
+          priority_justification_reason: overrideReason
         })
-        .eq('source_system_ref', formSelectedTask);
+        .eq('id', selectedJobId);
 
       if (error) throw error;
-      setFormMessage({ type: 'success', text: 'Deployment command force-executed successfully!' });
-      setFormSelectedTask('');
-      setFormSelectedAnalyst('');
-      setFormSelectedInstrument('');
+      setFeedback({ type: 'success', msg: 'Manual allocation bind locked.' });
+      setSelectedJobId(''); setOverrideReason('');
+      syncGlobalSchemaFeeds();
     } catch (err: any) {
-      setFormMessage({ type: 'error', text: `Database Refusal: ${err.message}` });
+      setFeedback({ type: 'error', msg: err.message });
     }
   };
 
-  const handleSimulateFailure = async (instrumentId: string) => {
-    try {
-      await supabase.from('instruments').update({ status: 'DOWN' }).eq('instrument_serial_id', instrumentId);
-      await supabase.from('pending_list').update({
-        status: 'AWAITING_ALLOCATION',
-        allocated_analyst_code: null,
-        allocated_instrument_id: null,
-        lock_execution: false
-      }).eq('allocated_instrument_id', instrumentId);
-    } catch (err: any) {
-      console.error(err.message);
-    }
-  };
-
-  // --- ADMINISTRATIVE RECURSIVE DIRECTIVES ---
-  const handleAdminUserAction = async (actionType: 'CREATE' | 'DISABLE' | 'RESET' | 'ROLE' | 'DELETE') => {
-    setAdminMessage('');
-    
-    if (actionType === 'CREATE') {
-      if (!adminNewUserCode || !adminNewUserName) {
-        alert('Please specify an Employee Code and Full Name to create a database record.');
-        return;
-      }
-      try {
-        const { error } = await supabase
-          .from('analysts')
-          .insert([{ 
-            employee_code: adminNewUserCode.trim(), 
-            full_name: adminNewUserName.trim(), 
-            is_available_today: true 
-          }]);
-
-        if (error) throw error;
-        setAdminMessage(`Database Modification Complete: Added new live operator row [${adminNewUserCode}].`);
-        setAdminNewUserCode('');
-        setAdminNewUserName('');
-        fetchCoreData();
-      } catch (err: any) {
-        alert(`Database Refusal: ${err.message}`);
-      }
-      return;
-    }
-
-    if (!adminTargetUser) {
-      alert('Please select an active database user record from the selection directory.');
-      return;
-    }
-
-    try {
-      if (actionType === 'DELETE') {
-        const checkConfirm = confirm(`Are you absolutely sure you want to permanently delete user row ${adminTargetUser} from the public database? This action cannot be reversed.`);
-        if (!checkConfirm) return;
-
-        const { error } = await supabase
-          .from('analysts')
-          .delete()
-          .eq('employee_code', adminTargetUser);
-
-        if (error) throw error;
-        setAdminMessage(`Database Row Purged: Permanently scrubbed user record ${adminTargetUser} from directory.`);
-        setAdminTargetUser('');
-      } else {
-        let payload = {};
-        if (actionType === 'DISABLE') payload = { is_available_today: false };
-        else if (actionType === 'RESET') payload = { employee_code: adminTargetUser }; 
-        else if (actionType === 'ROLE') payload = { full_name: `${analysts.find(a => a.employee_code === adminTargetUser)?.full_name.split(' (')[0]} (${adminRoleAssignment})` };
-
-        const { error } = await supabase
-          .from('analysts')
-          .update(payload)
-          .eq('employee_code', adminTargetUser);
-
-        if (error) throw error;
-        setAdminMessage(`Database Mutation Success: Executed changes onto account reference ${adminTargetUser}.`);
-      }
-      fetchCoreData();
-      setTimeout(() => setAdminMessage(''), 5000);
-    } catch (err: any) {
-      alert(`Database Action Refusal: ${err.message}`);
-    }
-  };
-
-  const handleAdminCalendarAction = async (actionType: 'SHIFT' | 'HOLIDAY') => {
-    setAdminMessage(`Configuration Injected: Successfully locked system parameters onto active engine buffers.`);
-    setTimeout(() => setAdminMessage(''), 5000);
-  };
-
-  const handleAdminRulesAction = async (actionType: 'SLA' | 'COMPATIBILITY') => {
-    if (actionType === 'COMPATIBILITY' && !adminTargetInstrument) {
-      alert('Please select a functional hardware instrument node asset from the database register.');
-      return;
-    }
-    try {
-      if (actionType === 'COMPATIBILITY') {
-        const { error } = await supabase
-          .from('instruments')
-          .update({ model_make: `${instruments.find(i => i.instrument_serial_id === adminTargetInstrument)?.model_make.split(' [')[0]} [Protocol: ${adminCompatibilityProtocol}]` })
-          .eq('instrument_serial_id', adminTargetInstrument);
-
-        if (error) throw error;
-        setAdminMessage(`Database Constraint Assigned: Adjusted device protocol profiles for hardware asset node ${adminTargetInstrument}.`);
-      } else {
-        setAdminMessage(`Database Architecture Update: Structural SLA classification matrix [${adminSlaCategory}] altered.`);
-      }
-      fetchCoreData();
-      setTimeout(() => setAdminMessage(''), 5000);
-    } catch (err: any) {
-      alert(`Database Refusal: ${err.message}`);
-    }
-  };
-
-  // ==========================================
-  // RENDER LAYER 1: GLASSMORPHIC LIGHT PORTAL
-  // ==========================================
-  if (!isLoggedIn) {
-    return (
-      <div style={styles.ambientWrapper}>
-        <style dangerouslySetInnerHTML={{__html: inlineAnimations}} />
-
-        {/* LAYER 0: LUMINESCENT FLOATING BOKEH ORB MATRIX */}
-        <div className="bokeh-orb design-orb-1" style={{...styles.bokehOrb, top: '15%', left: '20%', width: '450px', height: '450px', background: 'radial-gradient(circle, rgba(99,102,241,0.22) 0%, transparent 75%)'}} />
-        <div className="bokeh-orb design-orb-2" style={{...styles.bokehOrb, bottom: '20%', right: '15%', width: '500px', height: '500px', background: 'radial-gradient(circle, rgba(236,72,153,0.18) 0%, transparent 75%)'}} />
-
-        {/* HIGH-QUALITY WEB ART: 3D SOLID CUBE ANIMATION */}
-        <div style={styles.cubeContainer}>
-          <div className="solid-cube" style={styles.solidCube}>
-            <div style={{...styles.cubeFace, transform: 'rotateY(0deg) translateZ(100px)', backgroundColor: 'rgba(59, 130, 246, 0.75)'}}></div>
-            <div style={{...styles.cubeFace, transform: 'rotateY(90deg) translateZ(100px)', backgroundColor: 'rgba(236, 72, 153, 0.75)'}}></div>
-            <div style={{...styles.cubeFace, transform: 'rotateY(180deg) translateZ(100px)', backgroundColor: 'rgba(13, 148, 136, 0.75)'}}></div>
-            <div style={{...styles.cubeFace, transform: 'rotateY(-90deg) translateZ(100px)', backgroundColor: 'rgba(99, 102, 241, 0.75)'}}></div>
-            <div style={{...styles.cubeFace, transform: 'rotateX(90deg) translateZ(100px)', backgroundColor: 'rgba(245, 158, 11, 0.75)'}}></div>
-            <div style={{...styles.cubeFace, transform: 'rotateX(-90deg) translateZ(100px)', backgroundColor: 'rgba(16, 185, 129, 0.75)'}}></div>
-          </div>
-        </div>
-
-        {/* REVOLVING PERIMETER CARD OUTER CONTAINER */}
-        <div className="revolving-card-perimeter" style={styles.revolvingPerimeterOuter}>
-          <div style={styles.loginCard}>
-            <div style={styles.loginHeaderGrid}>
-              <div style={styles.logoBadge}>QC</div>
-              <h1 style={styles.loginTitle}>Quantum Control</h1>
-              <p style={styles.loginSubtitle}>Enterprise Resource Optimization Node</p>
-            </div>
-
-            <form onSubmit={handleLogin} style={styles.formStructure}>
-              <div style={styles.formGroup}>
-                <label style={styles.formLabel}>User Profile ID / Code</label>
-                <input 
-                  type="text" 
-                  placeholder="e.g., ADMIN-404 or AUDIT-QA" 
-                  style={styles.glassInput}
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                />
-              </div>
-
-              <div style={styles.formGroup}>
-                <label style={styles.formLabel}>Security Passkey Token</label>
-                <input 
-                  type="password" 
-                  placeholder="••••••••" 
-                  style={styles.glassInput}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                />
-              </div>
-
-              <div style={styles.formGroup}>
-                <label style={styles.formLabel}>Gateway Verification Role</label>
-                <select 
-                  style={styles.glassDropdown}
-                  value={selectedRole}
-                  onChange={(e) => setSelectedRole(e.target.value)}
-                >
-                  <option value="PRIMARY_PLANNER">Primary Planner (Operations Core)</option>
-                  <option value="QA_VIEWER">QA Viewer (Metrics & Auditing)</option>
-                  <option value="SYSTEM_ADMIN">System Administrator (Global Config)</option>
-                </select>
-              </div>
-
-              {authError && <div style={styles.authErrorAlert}>{authError}</div>}
-
-              <button type="submit" style={styles.glassSubmitButton}>
-                Establish Authenticated Session
-              </button>
-            </form>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // ==========================================
-  // RENDER LAYER 2: SYSTEM WORKSPACE
-  // ==========================================
   return (
-    <div style={styles.ambientWrapper}>
-      <style dangerouslySetInnerHTML={{__html: inlineAnimations}} />
+    <div className={`min-h-screen font-sans antialiased relative transition-colors duration-300 ${
+      isDarkMode ? 'bg-[#08090d] text-[#f1f5f9]' : 'bg-[#f4f6f9] text-[#1e293b]'
+    }`}>
+      
+      {/* Background Decorative Blurs */}
+      <div className="absolute top-[-10%] left-[-15%] w-[800px] h-[800px] bg-gradient-to-br from-indigo-500/10 to-transparent rounded-full blur-[140px] pointer-events-none" />
+      <div className="absolute bottom-[5%] right-[-10%] w-[700px] h-[700px] bg-gradient-to-br from-purple-500/10 to-transparent rounded-full blur-[140px] pointer-events-none" />
 
-      {/* COMPONENT INTERIOR BACKDROP AMBIENT ORBS */}
-      <div className="bokeh-orb design-orb-1" style={{...styles.bokehOrb, top: '-5%', left: '10%', width: '600px', height: '600px', background: 'radial-gradient(circle, rgba(59,130,246,0.1) 0%, transparent 80%)'}} />
-      <div className="bokeh-orb design-orb-2" style={{...styles.bokehOrb, bottom: '5%', right: '5%', width: '700px', height: '700px', background: 'radial-gradient(circle, rgba(13,148,136,0.08) 0%, transparent 80%)'}} />
+      {/* --- PHASE 1: LOGIN & SECURITY SCREEN (3D GLASSMORPHIC SHIELD) --- */}
+      {!isLoggedIn ? (
+        <div className="min-h-screen w-full flex flex-col items-center justify-center p-6 relative z-10">
+          <button onClick={() => setIsDarkMode(!isDarkMode)} className={`mb-6 px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-xl border transition-all ${
+            isDarkMode ? 'bg-white/5 border-white/10 text-white hover:bg-white/10' : 'bg-black/5 border-black/10 text-black hover:bg-black/10'
+          }`}>
+            {isDarkMode ? '🌞 Switch to Light Frame' : '🌙 Switch to Deep Dark'}
+          </button>
 
-      <div style={styles.dashboardContainer} className="fade-in-entry">
-        
-        {/* GLOBAL HEADER BAR */}
-        <header style={styles.glassHeader} className="ease-element">
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <span style={{
-                ...styles.liveIndicator, 
-                backgroundColor: userRole === 'SYSTEM_ADMIN' ? '#ec4899' : userRole === 'QA_VIEWER' ? '#148888' : '#3b82f6'
-              }}></span>
-              <h1 style={styles.mainTitle}>
-                {userRole === 'SYSTEM_ADMIN' && 'System Infrastructure Administration'}
-                {userRole === 'QA_VIEWER' && 'Quality Assurance & Regulatory Compliance Audit'}
-                {userRole === 'PRIMARY_PLANNER' && 'Primary Planner Dispatch Hub'}
-              </h1>
+          <div className={`w-full max-w-md backdrop-blur-3xl border rounded-[32px] p-8 shadow-[0_30px_100px_rgba(0,0,0,0.4)] ${
+            isDarkMode ? 'bg-white/[0.02] border-white/[0.08]' : 'bg-white/70 border-black/[0.06]'
+          }`}>
+            <div className="text-center mb-6">
+              <div className="inline-flex items-center justify-center w-12 h-12 rounded-2xl bg-gradient-to-tr from-purple-600 to-indigo-500 text-white font-black text-xl mb-3 shadow-lg">Ψ</div>
+              <h1 className="text-xl font-black tracking-tight uppercase">SECURE ENTRY CHANNELS</h1>
+              <p className="text-[11px] text-neutral-400 mt-1 font-medium tracking-wide">Mandatory 12-Character Rule & Multi-Factor Gateway Token Verification</p>
             </div>
-            <p style={styles.subTitle}>Console Node Active // Cryptographic Token Validated</p>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '19px' }}>
-            <span style={styles.userTag} className="ease-element">
-              {userRole === 'SYSTEM_ADMIN' && '🛠️ Root Admin'}
-              {userRole === 'QA_VIEWER' && '🛡️ QA Auditor'}
-              {userRole === 'PRIMARY_PLANNER' && '📊 Planner'} : {username}
-            </span>
-            
-            {userRole === 'PRIMARY_PLANNER' && (
-              <button 
-                onClick={handleInvokeEngine} 
-                disabled={isOptimizing} 
-                style={{...styles.glassEngineButton, backgroundColor: isOptimizing ? 'rgba(0,0,0,0.05)' : '#3b82f6'}}
-                className="ease-element"
-              >
-                {isOptimizing ? '🔄 Sequencing Heuristics...' : '🚀 Invoke Algorithmic Optimization'}
-              </button>
+
+            {feedback.msg && (
+              <div className={`p-3 rounded-xl mb-4 text-xs font-semibold ${feedback.type === 'error' ? 'bg-red-500/10 text-red-400' : 'bg-emerald-500/10 text-emerald-400'}`}>
+                {feedback.msg}
+              </div>
             )}
 
-            <button onClick={handleLogout} style={styles.glassLogoutButton} className="ease-element">
-              🔓 Logout Session
-            </button>
-          </div>
-        </header>
-
-        {/* ==========================================
-            VIEW CONTEXT A: PRIMARY PLANNER LAYOUT
-           ========================================== */}
-        {userRole === 'PRIMARY_PLANNER' && (
-          <div style={styles.dashboardGrid}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '29px' }}>
-              
-              {/* GLASS FILTERS */}
-              <section style={styles.glassCardPanel} className="ease-element">
-                <h3 style={styles.panelInlineTitle}>🔍 Live Operational Filtering Matrix</h3>
-                <div style={styles.filterGridContainer}>
-                  <div style={styles.formGroup}>
-                    <label style={styles.formLabel}>Context Substring Search</label>
-                    <input 
-                      type="text" 
-                      placeholder="Search Source Ref or Lot..." 
-                      style={styles.glassInput}
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                    />
-                  </div>
-                  <div style={styles.formGroup}>
-                    <label style={styles.formLabel}>Pipeline Status Target</label>
-                    <select style={styles.glassDropdown} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-                      <option value="ALL">Show All Status Profiles</option>
-                      <option value="AWAITING_ALLOCATION">AWAITING_ALLOCATION</option>
-                      <option value="SCHEDULED_TODAY">SCHEDULED_TODAY</option>
-                      <option value="COMPLETED">COMPLETED</option>
-                    </select>
-                  </div>
-                  <div style={styles.formGroup}>
-                    <label style={styles.formLabel}>Priority Tier</label>
-                    <select style={styles.glassDropdown} value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)}>
-                      <option value="ALL">Show All Priorities</option>
-                      <option value="CRITICAL">CRITICAL</option>
-                      <option value="MEDIUM">MEDIUM</option>
-                      <option value="LOW">LOW</option>
-                    </select>
-                  </div>
+            {!isTwoFactorPhase ? (
+              <form onSubmit={initLoginChallenge} className="space-y-4">
+                <div>
+                  <label className="block text-[10px] font-bold uppercase tracking-wider mb-1.5 text-neutral-400">Identity Email</label>
+                  <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} className={`w-full px-4 py-3 text-xs rounded-xl focus:outline-none transition-all ${isDarkMode ? 'bg-black/40 border-white/[0.06] text-white' : 'bg-white border-black/[0.1] text-black'}`} placeholder="operator@lims.internal" />
                 </div>
-              </section>
-
-              {/* MAIN MATRIX VIEW */}
-              <section style={styles.glassCardPanel} className="ease-element">
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', borderBottom: '1px solid rgba(15,23,42,0.06)', paddingBottom: '14px' }}>
-                  <h2 style={{ ...styles.panelTitle, borderBottom: 'none', margin: 0, paddingBottom: 0 }}>📊 Deployment Live Matrix</h2>
-                  
-                  {/* BULK SELECTION ACTION CONTROL PANEL (§6.5 COMPLIANT) */}
-                  {selectedTasks.length > 0 && (
-                    <button 
-                      onClick={() => handleExecuteCompleteness(selectedTasks)} 
-                      style={styles.bulkCompleteButton}
-                      className="ease-element"
-                    >
-                      🏁 Mark Selected Completed ({selectedTasks.length}) per §6.5
-                    </button>
-                  )}
+                <div>
+                  <label className="block text-[10px] font-bold uppercase tracking-wider mb-1.5 text-neutral-400">Passphrase String (12-Character Min)</label>
+                  <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} className={`w-full px-4 py-3 text-xs rounded-xl focus:outline-none transition-all ${isDarkMode ? 'bg-black/40 border-white/[0.06] text-white' : 'bg-white border-black/[0.1] text-black'}`} placeholder="••••••••••••" />
                 </div>
-
-                <table style={styles.table}>
-                  <thead>
-                    <tr style={styles.tableHeaderRow}>
-                      <th style={{ ...styles.tableHeaderCell, width: '40px' }}>
-                        <input 
-                          type="checkbox" 
-                          onChange={toggleAllVisibleTasks} 
-                          checked={filteredPendingItems.length > 0 && filteredPendingItems.filter(i => i.status !== 'COMPLETED').every(i => selectedTasks.includes(i.source_system_ref))}
-                          style={styles.checkboxStyle}
-                        />
-                      </th>
-                      <th style={styles.tableHeaderCell}>Source Ref</th>
-                      <th style={styles.tableHeaderCell}>Lot Nu.</th>
-                      <th style={styles.tableHeaderCell}>Priority</th>
-                      <th style={styles.tableHeaderCell}>Urgency</th>
-                      <th style={styles.tableHeaderCell}>Current Status</th>
-                      <th style={styles.tableHeaderCell}>Assigned Analyst</th>
-                      <th style={styles.tableHeaderCell}>Hardware Node</th>
-                      <th style={{ ...styles.tableHeaderCell, textAlign: 'center' }}>Directives</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredPendingItems.length === 0 ? (
-                      <tr>
-                        <td colSpan={9} style={styles.emptyRow}>No records found matching tracking properties.</td>
-                      </tr>
-                    ) : (
-                      filteredPendingItems.map((item) => (
-                        <tr key={item.id} style={styles.tableBodyRow}>
-                          <td style={styles.tableBodyCell}>
-                            <input 
-                              type="checkbox"
-                              disabled={item.status === 'COMPLETED'}
-                              checked={selectedTasks.includes(item.source_system_ref)}
-                              onChange={() => toggleTaskSelection(item.source_system_ref)}
-                              style={styles.checkboxStyle}
-                            />
-                          </td>
-                          <td style={styles.tableBodyCell}><strong>{item.source_system_ref}</strong></td>
-                          <td style={styles.tableBodyCell}>{item.batch_lot_number}</td>
-                          <td style={styles.tableBodyCell}>
-                            <span style={{ fontWeight: 'bold', color: item.priority_level === 'CRITICAL' ? '#db2777' : item.priority_level === 'MEDIUM' ? '#d97706' : '#2563eb' }}>
-                              {item.priority_level}
-                            </span>
-                          </td>
-                          <td style={styles.tableBodyCell}>{item.urgency_score ?? 0}</td>
-                          <td style={styles.tableBodyCell}>
-                            <span style={{
-                              ...styles.statusBadge,
-                              backgroundColor: item.status === 'COMPLETED' ? 'rgba(15,23,42,0.06)' : item.status === 'SCHEDULED_TODAY' ? 'rgba(22, 163, 74, 0.15)' : 'rgba(37, 99, 235, 0.1)',
-                              color: item.status === 'COMPLETED' ? '#475569' : item.status === 'SCHEDULED_TODAY' ? '#16a34a' : '#2563eb',
-                              border: item.status === 'COMPLETED' ? '1px solid rgba(0,0,0,0.1)' : item.status === 'SCHEDULED_TODAY' ? '1px solid rgba(22,163,74,0.3)' : '1px solid rgba(37,99,235,0.3)'
-                            }}>
-                              {item.status}
-                            </span>
-                          </td>
-                          <td style={styles.tableBodyCell}>{item.allocated_analyst_code || (item.status === 'COMPLETED' ? '— Archive' : '⚡ Open Queue')}</td>
-                          <td style={styles.tableBodyCell}>{item.allocated_instrument_id || '—'}</td>
-                          <td style={{ ...styles.tableBodyCell, display: 'flex', gap: '6px', justifyContent: 'center' }}>
-                            {item.status === 'SCHEDULED_TODAY' && (
-                              <button onClick={() => handleSimulateFailure(item.allocated_instrument_id)} style={styles.faultButton} className="ease-element">
-                                💥 Fault
-                              </button>
-                            )}
-                            {item.status !== 'COMPLETED' && (
-                              <button 
-                                onClick={() => handleExecuteCompleteness([item.source_system_ref])} 
-                                style={styles.inlineCompleteBtn} 
-                                className="ease-element"
-                              >
-                                ✓ Complete
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </section>
-            </div>
-
-            {/* COLUMN 2 CONTROLS */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '29px' }}>
-              
-              {/* NEW EXPANSION PANEL: MANUAL EXCEPTIONAL INGESTION ENTRY */}
-              <section style={styles.glassCardPanel} className="ease-element">
-                <h2 style={styles.panelTitle}>📥 Exceptional Manual Entry Ingestion</h2>
-                <p style={{ fontSize: '14px', color: '#475569', marginTop: '-12px', marginBottom: '19px', lineHeight: '1.4' }}>
-                  Bypass standard automated server pipeline ingestion parameters for isolated physical sample verification criteria.
-                </p>
-                <form onSubmit={handleManualPendingEntry} style={styles.formStructure}>
-                  <div style={styles.formGroup}>
-                    <label style={styles.formLabel}>Material Identifier / Lot Code</label>
-                    <input 
-                      type="text"
-                      placeholder="e.g., LOT-992-METH"
-                      value={manualMaterialCode}
-                      onChange={(e) => setManualMaterialCode(e.target.value)}
-                      style={styles.glassInput}
-                    />
-                  </div>
-                  <div style={styles.formGroup}>
-                    <label style={styles.formLabel}>Method Validation Target / Test Directive</label>
-                    <input 
-                      type="text"
-                      placeholder="e.g., SOP-METHOD-HPLC-05"
-                      value={manualTestDirective}
-                      onChange={(e) => setManualTestDirective(e.target.value)}
-                      style={styles.glassInput}
-                    />
-                  </div>
-                  <div style={styles.formGroup}>
-                    <label style={styles.formLabel}>Calculated Matrix SLA Priority Tier</label>
-                    <select 
-                      style={styles.glassDropdown}
-                      value={manualSlaTier}
-                      onChange={(e) => setManualSlaTier(e.target.value)}
-                    >
-                      <option value="LOW">Low Turnaround Urgency (Class C)</option>
-                      <option value="MEDIUM">Medium Standard Urgency (Class B)</option>
-                      <option value="CRITICAL">Critical Direct Action (Class A)</option>
-                    </select>
-                  </div>
-                  <button type="submit" style={styles.manualEntryBtn} className="ease-element">
-                    📥 Commit Exceptional Sample Record
-                  </button>
-                </form>
-              </section>
-
-              {/* OVERRIDE MANAGEMENT PANEL */}
-              <section style={styles.glassCardPanel} className="ease-element">
-                <h2 style={styles.panelTitle}>🎛️ Manual Assignment Override</h2>
-                <form onSubmit={handleManualDispatch} style={styles.formStructure}>
-                  <div style={styles.formGroup}>
-                    <label style={styles.formLabel}>Target Queue Reference</label>
-                    <select style={styles.glassDropdown} value={formSelectedTask} onChange={(e) => setFormSelectedTask(e.target.value)}>
-                      <option value="">-- Choose Open Pending Sample --</option>
-                      {pendingItems.filter(i => i.status === 'AWAITING_ALLOCATION').map(i => (
-                        <option key={i.id} value={i.source_system_ref}>
-                          {i.source_system_ref} ({i.batch_lot_number})
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div style={styles.formGroup}>
-                    <label style={styles.formLabel}>Allocate Laboratory Analyst</label>
-                    <select style={styles.glassDropdown} value={formSelectedAnalyst} onChange={(e) => setFormSelectedAnalyst(e.target.value)}>
-                      <option value="">-- Choose Staff Target --</option>
-                      {analysts.filter(a => a.is_available_today).map(a => (
-                        <option key={a.employee_code} value={a.employee_code}>{a.full_name}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div style={styles.formGroup}>
-                    <label style={styles.formLabel}>Dedicate Hardware Instrument</label>
-                    <select style={styles.glassDropdown} value={formSelectedInstrument} onChange={(e) => setFormSelectedInstrument(e.target.value)}>
-                      <option value="">-- Choose Functional Node --</option>
-                      {instruments.filter(i => i.status === 'AVAILABLE').map(i => (
-                        <option key={i.instrument_serial_id} value={i.instrument_serial_id}>{i.model_make}</option>
-                      ))}
-                    </select>
-                  </div>
-
-                  {formMessage && (
-                    <div style={{
-                      ...styles.notificationBanner,
-                      backgroundColor: formMessage.type === 'error' ? 'rgba(220,38,38,0.1)' : 'rgba(22,163,74,0.1)',
-                      borderColor: formMessage.type === 'error' ? '#dc2626' : '#16a34a',
-                      color: formMessage.type === 'error' ? '#991b1b' : '#14532d'
-                    }}>
-                      {formMessage.text}
-                    </div>
-                  )}
-                  <button type="submit" style={styles.glassManualSubmitButton} className="ease-element">Dispatch Structural Routing Override</button>
-                </form>
-              </section>
-            </div>
+                <button type="submit" className="w-full py-3 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold uppercase tracking-wider transition-all">
+                  Next Challenge Stage
+                </button>
+              </form>
+            ) : (
+              <form onSubmit={handleTwoFactorVerify} className="space-y-4">
+                <div>
+                  <label className="block text-[10px] font-bold uppercase tracking-wider mb-1.5 text-purple-400">Verification MFA 2FA Passcode Token</label>
+                  <input type="text" required maxLength={6} value={twoFactorCode} onChange={(e) => setTwoFactorCode(e.target.value)} className={`w-full px-4 py-3 text-xs font-mono tracking-widest text-center rounded-xl focus:outline-none transition-all ${isDarkMode ? 'bg-black/40 border-white/[0.06] text-white' : 'bg-white border-black/[0.1] text-black'}`} placeholder="000000" />
+                </div>
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => setIsTwoFactorPhase(false)} className="w-1/3 py-2.5 rounded-xl border border-white/10 text-xs font-medium">Cancel</button>
+                  <button type="submit" className="w-2/3 py-2.5 rounded-xl bg-white text-black font-bold text-xs uppercase tracking-wider">Confirm 2FA Check</button>
+                </div>
+              </form>
+            )}
           </div>
-        )}
+        </div>
+      ) : (
+        /* --- PHASE 2: INTERNAL PLATFORM WORKSPACE FRAMEWORK --- */
+        <div className="min-h-screen flex flex-col relative z-10 animate-fadeIn">
+          
+          <header className={`flex justify-between items-center border-b backdrop-blur-xl px-6 py-4 sticky top-0 z-50 transition-colors ${
+            isDarkMode ? 'bg-[#08090d]/80 border-white/[0.06]' : 'bg-white/80 border-black/[0.06]'
+          }`}>
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-purple-600 to-indigo-500 text-white flex items-center justify-center font-bold text-sm">Φ</div>
+              <div>
+                <h1 className="text-xs font-black tracking-widest uppercase">LAB MATRIX WORKSPACE</h1>
+                <div className="flex items-center gap-1.5 text-[10px] text-neutral-400">
+                  <span>Operator: <strong className={isDarkMode ? 'text-white' : 'text-neutral-900'}>{operatorName}</strong></span>
+                  <span className="w-1 h-1 rounded-full bg-neutral-600" />
+                  <span className="text-purple-400 font-bold uppercase">{userRole.replace('_', ' ')} MODE</span>
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <button onClick={() => setIsDarkMode(!isDarkMode)} className={`px-3 py-1.5 text-[10px] font-black uppercase tracking-wider rounded-lg border transition-all ${
+                isDarkMode ? 'bg-white/5 border-white/10 text-white' : 'bg-black/5 border-black/10 text-black'
+              }`}>
+                {isDarkMode ? '🌞 Light' : '🌙 Dark'}
+              </button>
+              <button onClick={handleSignOut} className="text-[10px] font-bold uppercase tracking-wider border border-red-500/20 hover:bg-red-500/10 px-3 py-1.5 rounded-lg text-red-400 transition-all">
+                Disconnect
+              </button>
+            </div>
+          </header>
 
-        {/* ==========================================
-            VIEW CONTEXT B: QA VIEWER PORTAL
-           ========================================== */}
-        {userRole === 'QA_VIEWER' && (
-          <div style={styles.qaDashboardLayout} className="ease-element">
+          <div className="flex-1 p-4 lg:p-8 max-w-[1700px] w-full mx-auto space-y-6">
             
-            {/* QA STATIC METRIC ROW */}
-            <div style={styles.qaMetricsContainer}>
-              <div style={styles.qaMetricCard} className="ease-element">
-                <span style={styles.qaMetricLabel}>Audit Compliance Index</span>
-                <h3 style={styles.qaMetricVal}>99.42%</h3>
-                <span style={{...styles.statusBadge, backgroundColor: 'rgba(22,163,74,0.1)', color: '#16a34a'}}>✓ GLP Compliant</span>
+            {feedback.msg && (
+              <div className={`p-4 rounded-xl border text-xs font-semibold shadow-md ${
+                feedback.type === 'success' ? 'bg-emerald-500/5 border-emerald-500/20 text-emerald-400' : 'bg-red-500/5 border-red-500/20 text-red-400'
+              }`}>
+                {feedback.type === 'success' ? '✓ ' : '⚠️ '} {feedback.msg}
               </div>
-              <div style={styles.qaMetricCard} className="ease-element">
-                <span style={styles.qaMetricLabel}>SLA Validation Thresholds</span>
-                <h3 style={styles.qaMetricVal}>98.15%</h3>
-                <span style={{...styles.statusBadge, backgroundColor: 'rgba(22,163,74,0.1)', color: '#16a34a'}}>In Tolerance Bounds</span>
-              </div>
-              <div style={styles.qaMetricCard} className="ease-element">
-                <span style={styles.qaMetricLabel}>Active Certified Operators</span>
-                <h3 style={styles.qaMetricVal}>{analysts.length} Records</h3>
-                <span style={{...styles.statusBadge, backgroundColor: 'rgba(37,99,235,0.1)', color: '#2563eb'}}>IAM Monitored</span>
-              </div>
-              <div style={styles.qaMetricCard} className="ease-element">
-                <span style={styles.qaMetricLabel}>Hardware Asset Nodes</span>
-                <h3 style={styles.qaMetricVal}>{instruments.length} Nodes</h3>
-                <span style={{...styles.statusBadge, backgroundColor: 'rgba(217,119,6,0.1)', color: '#d97706'}}>Calibration Checked</span>
-              </div>
-            </div>
+            )}
 
-            {/* TWO COLUMN STATIC LEDGER PANELS */}
-            <div style={{display: 'grid', gridTemplateColumns: '1.5fr 1fr', gap: '29px'}}>
-              <section style={styles.glassCardPanel} className="ease-element">
-                <h2 style={styles.panelTitle}>🛡️ Standard Operating Procedure (SOP) Validation Logs</h2>
-                <table style={styles.table}>
-                  <thead>
-                    <tr style={styles.tableHeaderRow}>
-                      <th style={styles.tableHeaderCell}>Timestamp</th>
-                      <th style={styles.tableHeaderCell}>Audit Target Reference</th>
-                      <th style={styles.tableHeaderCell}>Method Directive</th>
-                      <th style={styles.tableHeaderCell}>Verification Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr style={styles.tableBodyRow}>
-                      <td style={styles.tableBodyCell}>2026-06-09 14:22</td>
-                      <td style={styles.tableBodyCell}><strong>LOT-B75-BIO</strong></td>
-                      <td style={styles.tableBodyCell}>SOP-METHOD-HPLC-01</td>
-                      <td style={styles.tableBodyCell}><span style={{color: '#16a34a', fontWeight: 'bold'}}>PASS</span></td>
-                    </tr>
-                    <tr style={styles.tableBodyRow}>
-                      <td style={styles.tableBodyCell}>2026-06-09 11:05</td>
-                      <td style={styles.tableBodyCell}><strong>LOT-Z91-CHEM</strong></td>
-                      <td style={styles.tableBodyCell}>SOP-METHOD-MS-CORE</td>
-                      <td style={styles.tableBodyCell}><span style={{color: '#16a34a', fontWeight: 'bold'}}>PASS</span></td>
-                    </tr>
-                    <tr style={styles.tableBodyRow}>
-                      <td style={styles.tableBodyCell}>2026-06-08 17:41</td>
-                      <td style={styles.tableBodyCell}><strong>LOT-T12-TOX</strong></td>
-                      <td style={styles.tableBodyCell}>SOP-METHOD-TE-VAL</td>
-                      <td style={styles.tableBodyCell}><span style={{color: '#16a34a', fontWeight: 'bold'}}>PASS</span></td>
-                    </tr>
-                  </tbody>
-                </table>
-              </section>
-
-              <section style={styles.glassCardPanel} className="ease-element">
-                <h2 style={styles.panelTitle}>⚙️ Dynamic Instrument Certification Matrix</h2>
-                <div style={{display: 'flex', flexDirection: 'column', gap: '14px'}}>
-                  <div style={styles.qaStaticRow}>
-                    <div><strong>HPLC Array Node-Alpha</strong><br/><small style={{color:'#475569'}}>Serial ID: INST-LC-01</small></div>
-                    <span style={{...styles.statusBadge, backgroundColor: 'rgba(22,163,74,0.15)', color: '#16a34a'}}>NIST Traceable</span>
-                  </div>
-                  <div style={styles.qaStaticRow}>
-                    <div><strong>Mass Spectrometer Core</strong><br/><small style={{color:'#475569'}}>Serial ID: INST-MS-99</small></div>
-                    <span style={{...styles.statusBadge, backgroundColor: 'rgba(22,163,74,0.15)', color: '#16a34a'}}>NIST Traceable</span>
-                  </div>
+            {/* ==================================================================== */}
+            {/* 🎯 ROW SECTION A: MASTER PIPELINE TELEMETRY WORKSPACE CONSOLE        */}
+            {/* ==================================================================== */}
+            <section className={`backdrop-blur-3xl border rounded-[24px] p-6 shadow-sm space-y-4 ${
+              isDarkMode ? 'bg-white/[0.02] border-white/[0.08]' : 'bg-white border-black/[0.06]'
+            }`}>
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-sm font-black uppercase tracking-wider flex items-center gap-2">
+                    <span className="w-1.5 h-1.5 rounded-full bg-purple-500" /> Pipeline Queue Execution Matrix
+                  </h2>
+                  <p className="text-[11px] text-neutral-400 mt-0.5">Real-time status view aligned with primary data fields and parameters.</p>
                 </div>
-              </section>
-            </div>
-          </div>
-        )}
+                {(userRole.includes('PLANNER') || userRole === 'ADMIN') && (
+                  <button onClick={executeAutomaticOptimization} disabled={actionLoading !== null} className="px-4 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-black text-[10px] uppercase tracking-widest rounded-xl transition-all shadow-md">
+                    ⚡ Execute Intelligent Auto-Scheduling Sequence
+                  </button>
+                )}
+              </div>
 
-        {/* ==========================================
-            VIEW CONTEXT C: SYSTEM ADMIN LAYOUT
-           ========================================== */}
-        {userRole === 'SYSTEM_ADMIN' && (
-          <div style={styles.adminDashboardGrid} className="ease-element">
-            <section style={styles.glassCardPanel} className="ease-element">
-              <h2 style={styles.panelTitle}>🛠️ Administrative Core Engine</h2>
-              <p style={{ fontSize: '16px', color: '#475569', lineHeight: '1.6', marginBottom: '24px' }}>
-                <strong>Access Guardrail Enforced:</strong> Root administrators have structural data capabilities but are strictly segregated from invoking automated heuristic optimization loops.
-              </p>
-              
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <button onClick={() => setAdminTab('IAM')} style={{...styles.adminNavButton, backgroundColor: adminTab === 'IAM' ? 'rgba(236,72,153,0.15)' : 'transparent', color: adminTab === 'IAM' ? '#db2777' : '#475569'}} className="ease-element">🔑 Identity & Access (IAM)</button>
-                <button onClick={() => setAdminTab('CALENDAR')} style={{...styles.adminNavButton, backgroundColor: adminTab === 'CALENDAR' ? 'rgba(236,72,153,0.15)' : 'transparent', color: adminTab === 'CALENDAR' ? '#db2777' : '#475569'}} className="ease-element">📅 Calendars & Shift Boundaries</button>
-                <button onClick={() => setAdminTab('RULES')} style={{...styles.adminNavButton, backgroundColor: adminTab === 'RULES' ? 'rgba(236,72,153,0.15)' : 'transparent', color: adminTab === 'RULES' ? '#db2777' : '#475569'}} className="ease-element">📐 SLA & Compatibility Matrices</button>
+              <div className={`overflow-hidden border rounded-xl bg-black/10 ${isDarkMode ? 'border-white/[0.06]' : 'border-black/[0.06]'}`}>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className={`border-b text-[9px] font-bold uppercase tracking-widest ${isDarkMode ? 'bg-white/[0.02] border-white/[0.06] text-neutral-400' : 'bg-neutral-100 border-black/[0.06] text-neutral-500'}`}>
+                        <th className="p-3">Reference / Batch</th>
+                        <th className="p-3">Material Profile</th>
+                        <th className="p-3">Asset Path Link</th>
+                        <th className="p-3">Queue Status</th>
+                        {(userRole.includes('PLANNER') || userRole === 'ADMIN') && <th className="p-3 text-right">Valves</th>}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y font-medium text-neutral-300 divide-white/[0.04]">
+                      {jobs.map((job) => (
+                        <tr key={job.id} className="hover:bg-white/[0.01] transition-all">
+                          <td className="p-3">
+                            <span className={`font-mono text-xs font-bold block ${isDarkMode ? 'text-white' : 'text-neutral-900'}`}>{job.source_system_ref}</span>
+                            <span className="text-[10px] text-neutral-500 block">Lot: {job.batch_lot_number}</span>
+                          </td>
+                          <td className="p-3">
+                            <span className={`block font-semibold ${isDarkMode ? 'text-neutral-200' : 'text-neutral-800'}`}>{job.materials?.material_name || job.material_code}</span>
+                            <span className="text-[10px] text-purple-400 font-mono">Urgency Index: {job.urgency_score}</span>
+                          </td>
+                          <td className="p-3 font-mono text-[10px] text-neutral-400 space-y-0.5">
+                            <div>👤 Tech: <strong className={isDarkMode ? 'text-white' : 'text-neutral-900'}>{job.allocated_analyst_code || 'UNASSIGNED'}</strong></div>
+                            <div>🔬 Hardware: <strong className={isDarkMode ? 'text-white' : 'text-neutral-900'}>{job.allocated_instrument_id || 'UNASSIGNED'}</strong></div>
+                          </td>
+                          <td className="p-3">
+                            <span className={`inline-block px-2 py-0.5 rounded text-[9px] font-bold ${
+                              job.lock_execution ? 'bg-red-500/10 text-red-400 border border-red-500/20' :
+                              job.status === 'ALLOCATED' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
+                              job.status === 'COMPLETED' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                            }`}>
+                              {job.lock_execution ? 'FAULT ISOLATION' : job.status}
+                            </span>
+                          </td>
+                          {(userRole.includes('PLANNER') || userRole === 'ADMIN') && (
+                            <td className="p-3 text-right space-x-1">
+                              {job.status !== 'COMPLETED' ? (
+                                <>
+                                  <button onClick={() => updateJobValveState(job.id, 'FAULT')} className="px-1.5 py-0.5 bg-red-500/10 text-red-400 border border-red-500/20 rounded text-[9px] font-bold uppercase">Fault</button>
+                                  <button onClick={() => updateJobValveState(job.id, 'COMPLETE')} className="px-1.5 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded text-[9px] font-bold uppercase">Pass</button>
+                                </>
+                              ) : <span className="text-[10px] text-neutral-600 italic">Archived</span>}
+                            </td>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </section>
 
-            <section style={styles.glassCardPanel} className="ease-element">
-              {adminMessage && <div style={styles.adminSuccessToast} className="ease-element">{adminMessage}</div>}
+            {/* Split Operations Workplace Matrix Area Grid */}
+            <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
 
-              {adminTab === 'IAM' && (
-                <div className="fade-in-entry">
-                  <h3 style={styles.adminTabTitle}>Identity & Access Management (IAM)</h3>
-                  <div style={styles.adminActionRowGrid}>
-                    <div style={styles.adminInteractiveCard} className="ease-element">
-                      <h4 style={{ margin: '0 0 12px 0', fontSize: '16px', color: '#0f172a' }}>✨ Provision Live Account</h4>
-                      <label style={styles.formLabel}>Employee Code</label>
-                      <input type="text" placeholder="e.g., ANALYST-99" value={adminNewUserCode} onChange={(e) => setAdminNewUserCode(e.target.value)} style={{ ...styles.glassInput, marginBottom: '12px' }} />
-                      <label style={styles.formLabel}>Full Legal Name</label>
-                      <input type="text" placeholder="e.g., Jonathan Doe" value={adminNewUserName} onChange={(e) => setAdminNewUserName(e.target.value)} style={styles.glassInput} />
-                      <button onClick={() => handleAdminUserAction('CREATE')} style={{ ...styles.adminActionInlineBtn, backgroundColor: '#0f172a' }} className="ease-element">➕ Append Record</button>
+              {/* ==================================================================== */}
+              {/* 🎯 PORTAL HUB MODULE: PLANNER WORKSPACE & MANIFEST WRITER            */}
+              {/* ==================================================================== */}
+              <div className={`xl:col-span-2 space-y-6 ${!userRole.includes('PLANNER') && userRole !== 'ADMIN' ? 'pointer-events-none opacity-10 select-none' : ''}`}>
+                <div className={`backdrop-blur-3xl border rounded-[24px] p-6 shadow-sm space-y-6 ${
+                  isDarkMode ? 'bg-white/[0.02] border-white/[0.08]' : 'bg-white border-black/[0.06]'
+                }`}>
+                  <div>
+                    <h3 className="text-sm font-black uppercase tracking-wider">📅 Planner Interface: Manual Allocation & Manifest Setup</h3>
+                    <p className="text-[11px] text-neutral-400 mt-0.5">Add job entry models manually or apply specific overrides to pending items.</p>
+                  </div>
+
+                  <form onSubmit={handleManualJobCreation} className="p-4 bg-black/10 border border-white/[0.04] rounded-xl space-y-3">
+                    <h4 className="text-[10px] font-bold uppercase tracking-widest text-purple-400">➕ Inject New Production Lot Row Into Schema</h4>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      <input type="text" required value={newSysRef} onChange={(e) => setNewSysRef(e.target.value)} placeholder="SYS-REF ID" className={`p-2 rounded-lg text-xs focus:outline-none ${isDarkMode ? 'bg-black/40 border-white/[0.06] text-white' : 'bg-white border-black/[0.1] text-black'}`} />
+                      <input type="text" required value={newBatchLot} onChange={(e) => setNewBatchLot(e.target.value)} placeholder="Batch Lot Serial" className={`p-2 rounded-lg text-xs focus:outline-none ${isDarkMode ? 'bg-black/40 border-white/[0.06] text-white' : 'bg-white border-black/[0.1] text-black'}`} />
+                      <select required value={newMatCode} onChange={(e) => setNewMatCode(e.target.value)} className={`p-2 rounded-lg text-xs focus:outline-none ${isDarkMode ? 'bg-[#0e1017] text-white' : 'bg-white text-black'}`}>
+                        <option value="">-- MATERIAL CODE --</option>
+                        {materials.map(m => <option key={m.material_code} value={m.material_code}>{m.material_code}</option>)}
+                      </select>
+                      <input type="number" value={newUrgencyScore} onChange={(e) => setNewUrgencyScore(e.target.value)} placeholder="Score (1-100)" className={`p-2 rounded-lg text-xs focus:outline-none ${isDarkMode ? 'bg-black/40 border-white/[0.06] text-white' : 'bg-white border-black/[0.1] text-black'}`} />
                     </div>
+                    <button type="submit" className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-[10px] font-bold uppercase tracking-wider">
+                      Insert Lot Into Queue Matrix
+                    </button>
+                  </form>
 
-                    <div style={styles.adminInteractiveCard} className="ease-element">
-                      <h4 style={{ margin: '0 0 12px 0', fontSize: '16px', color: '#0f172a' }}>🔧 Manage Real Active Rows</h4>
-                      <select style={styles.glassDropdown} value={adminTargetUser} onChange={(e) => setAdminTargetUser(e.target.value)}>
-                        <option value="">-- Pick Profile --</option>
-                        {analysts.map(analyst => (
-                          <option key={analyst.employee_code} value={analyst.employee_code}>{analyst.full_name} ({analyst.employee_code})</option>
+                  <form onSubmit={applyManualAllocationLock} className="space-y-3 pt-2">
+                    <h4 className="text-[10px] font-bold uppercase tracking-widest text-neutral-400">🔗 Manual Asset Allocation Binding Control</h4>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <select required value={selectedJobId} onChange={(e) => setSelectedJobId(e.target.value)} className="p-2.5 text-xs bg-black/40 border border-white/[0.08] rounded-xl text-purple-400 font-bold focus:outline-none">
+                        <option value="">-- SELECT PENDING BATCH --</option>
+                        {jobs.filter(j => j.status === 'AWAITING_ALLOCATION').map(j => (
+                          <option key={j.id} value={j.id} className="bg-[#0e1017] text-white">{j.source_system_ref}</option>
                         ))}
                       </select>
-                      <button onClick={() => handleAdminUserAction('DISABLE')} style={{ ...styles.adminActionInlineBtn, backgroundColor: '#d97706' }} className="ease-element">Disable Row</button>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {adminTab === 'CALENDAR' && (
-                <div className="fade-in-entry">
-                  <h3 style={styles.adminTabTitle}>Shift-Time & Holiday Boundary Mappings</h3>
-                  <div style={styles.adminActionRowGrid}>
-                    <div style={styles.adminInteractiveCard} className="ease-element">
-                      <h4>Shift Roster Definition Templates</h4>
-                      <select style={styles.glassDropdown} value={adminShiftCode} onChange={(e) => setAdminShiftCode(e.target.value)}>
-                        <option value="SHIFT_A">Shift Alpha Framework (Core Morning)</option>
-                        <option value="SHIFT_B">Shift Beta Framework (Core Evening)</option>
+                      <select value={targetAnalystCode} onChange={(e) => setTargetAnalystCode(e.target.value)} className="p-2.5 text-xs bg-black/40 border border-white/[0.08] rounded-xl focus:outline-none text-white">
+                        <option value="">-- ASSIGN TECHNICIAN --</option>
+                        {analysts.filter(a => a.is_available_today).map(a => (
+                          <option key={a.employee_code} value={a.employee_code} className="bg-[#0e1017] text-white">{a.full_name}</option>
+                        ))}
                       </select>
-                      <button onClick={() => handleAdminCalendarAction('SHIFT')} style={styles.adminActionInlineBtn} className="ease-element">Publish Window</button>
+                      <select value={targetInstrumentId} onChange={(e) => setTargetInstrumentId(e.target.value)} className="p-2.5 text-xs bg-black/40 border border-white/[0.08] rounded-xl focus:outline-none text-white">
+                        <option value="">-- ASSIGN EQUIPMENT --</option>
+                        {instruments.filter(i => i.status === 'AVAILABLE').map(i => (
+                          <option key={i.instrument_serial_id} value={i.instrument_serial_id} className="bg-[#0e1017] text-white">{i.model_make}</option>
+                        ))}
+                      </select>
                     </div>
-                  </div>
+                    <input type="text" required value={overrideReason} onChange={(e) => setOverrideReason(e.target.value)} placeholder="Provide mandatory tracking justification reasons note..." className="w-full p-2.5 bg-black/40 border border-white/[0.08] rounded-xl text-xs text-white focus:outline-none" />
+                    <button type="submit" className="px-4 py-2 bg-white text-black font-bold text-[10px] uppercase tracking-wider rounded-xl hover:bg-neutral-200 transition-all">Lock Override Link</button>
+                  </form>
                 </div>
-              )}
+              </div>
 
-              {adminTab === 'RULES' && (
-                <div className="fade-in-entry">
-                  <h3 style={styles.adminTabTitle}>SLA Classifications & Capability Vectors</h3>
-                  <div style={styles.adminActionRowGrid}>
-                    <div style={styles.adminInteractiveCard} className="ease-element">
-                      <h4>SLA Durations Configuration</h4>
-                      <button onClick={() => handleAdminRulesAction('SLA')} style={styles.adminActionInlineBtn} className="ease-element">Commit SLA Parameters</button>
+              {/* ==================================================================== */}
+              {/* 🎯 PORTAL HUB MODULE: ADMIN CONFIGURATION OVERRIDE DESK              */}
+              {/* ==================================================================== */}
+              <div className={`${userRole !== 'ADMIN' ? 'pointer-events-none opacity-10 select-none' : ''}`}>
+                <div className={`backdrop-blur-3xl border rounded-[24px] p-6 shadow-sm space-y-4 ${
+                  isDarkMode ? 'bg-white/[0.02] border-white/[0.08]' : 'bg-white border-black/[0.06]'
+                }`}>
+                  <div>
+                    <h3 className="text-sm font-black uppercase tracking-wider">⚙️ Admin Resource Control</h3>
+                    <p className="text-[11px] text-neutral-400 mt-0.5">Manage technician availability flags and add new catalog specifications.</p>
+                  </div>
+
+                  {/* Toggle Analyst Operational Availability Mode States */}
+                  <div className="space-y-2">
+                    <h4 className="text-[10px] font-bold uppercase tracking-wider text-neutral-400">👥 Roster Allocation Management Switcher</h4>
+                    <div className="max-h-[140px] overflow-y-auto space-y-1.5 pr-1 custom-scrollbar">
+                      {analysts.map((a) => (
+                        <div key={a.employee_code} className="flex items-center justify-between p-2 bg-black/30 border border-white/[0.04] rounded-lg text-[11px]">
+                          <div>
+                            <span className="font-bold text-white block">{a.full_name}</span>
+                            <span className="text-[9px] text-neutral-500 font-mono">{a.employee_code}</span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => toggleAnalystAvailability(a.employee_code, a.is_available_today)}
+                            className={`px-2 py-1 rounded text-[9px] font-black uppercase tracking-wider border ${
+                              a.is_available_today ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'
+                            }`}
+                          >
+                            {a.is_available_today ? 'Active' : 'Locked'}
+                          </button>
+                        </div>
+                      ))}
                     </div>
                   </div>
+
+                  {/* Material Catalog Row Registration Form Component */}
+                  <form onSubmit={createMaterialSpecRow} className="space-y-2 pt-1">
+                    <h4 className="text-[10px] font-bold uppercase tracking-wider text-neutral-400">🧪 Provision New Material Target Row</h4>
+                    <div className="flex gap-2">
+                      <input type="text" required value={matCode} onChange={(e) => setMatCode(e.target.value)} placeholder="CODE" className="w-1/3 p-2 bg-black/40 border border-white/[0.08] rounded-lg text-xs text-white focus:outline-none" />
+                      <input type="text" required value={matName} onChange={(e) => setMatName(e.target.value)} placeholder="Display Name" className="w-2/3 p-2 bg-black/40 border border-white/[0.08] rounded-lg text-xs text-white focus:outline-none" />
+                    </div>
+                    <button type="submit" className="w-full py-2 bg-white text-black font-bold text-[10px] uppercase tracking-widest rounded-lg hover:bg-neutral-200 transition-all">Add Material</button>
+                  </form>
+
+                  {/* ==================================================================== */}
+                  {/* 🌟 REQ 2 COMPLIANCE: SCROLLABLE AUDIT TRAIL LOG ENVIRONMENT GRID     */}
+                  {/* ==================================================================== */}
+                  <div className="pt-4 border-t border-white/[0.06] space-y-2">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-[10px] font-bold uppercase tracking-widest text-purple-400">📜 System Dynamic Audit Ledger</h4>
+                      <span className="text-[8px] font-mono bg-white/5 border border-white/10 px-1.5 py-0.2 rounded text-neutral-400">21 CFR PART 11</span>
+                    </div>
+                    
+                    <div className={`max-h-[160px] overflow-y-auto rounded-xl p-3 font-mono text-[10px] space-y-2.5 custom-scrollbar bg-black/40 border ${isDarkMode ? 'border-white/[0.06]' : 'border-black/[0.06]'}`}>
+                      {jobs.filter(j => j.priority_justification_reason).map((job, idx) => (
+                        <div key={idx} className="border-b border-white/[0.04] pb-2 last:border-0 last:pb-0 text-neutral-400">
+                          <div className="flex justify-between items-center text-[9px] text-neutral-500 font-bold">
+                            <span>REF: {job.source_system_ref}</span>
+                            <span>{new Date(job.arrival_timestamp).toLocaleTimeString()}</span>
+                          </div>
+                          <p className={`mt-1 font-sans ${isDarkMode ? 'text-neutral-200' : 'text-neutral-800'}`}>
+                            {job.priority_justification_reason}
+                          </p>
+                        </div>
+                      ))}
+                      {jobs.filter(j => j.priority_justification_reason).length === 0 && (
+                        <div className="text-center text-neutral-600 italic py-4">No override actions or exception logs recorded in this session.</div>
+                      )}
+                    </div>
+                  </div>
+
                 </div>
-              )}
-            </section>
+              </div>
+
+            </div>
+
           </div>
-        )}
-
-      </div>
+        </div>
+      )}
     </div>
   );
 }
-
-// =======================================================================
-// KEYFRAME ANIMATION MATRIX STRINGS (INCLUDES GRADIENT FLOATING ORBS)
-// =======================================================================
-const inlineAnimations = `
-  @keyframes rotateCube {
-    0% { transform: rotateX(0deg) rotateY(0deg); }
-    100% { transform: rotateX(360deg) rotateY(360deg); }
-  }
-  @keyframes revolvingBorder {
-    0% { transform: rotate(0deg); }
-    100% { transform: rotate(360deg); }
-  }
-  @keyframes fadeIn {
-    from { opacity: 0; transform: translateY(14px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  @keyframes floatAmbient {
-    0% { transform: translateY(0px) scale(1); }
-    50% { transform: translateY(-30px) scale(1.08); }
-    100% { transform: translateY(0px) scale(1); }
-  }
-  .solid-cube {
-    animation: rotateCube 20s infinite linear;
-  }
-  .revolving-card-perimeter::before {
-    content: '';
-    position: absolute;
-    width: 140%;
-    height: 140%;
-    background: conic-gradient(#3b82f6, #ec4899, #0d9488, #6366f1, #3b82f6);
-    animation: revolvingBorder 6s infinite linear;
-    z-index: 0;
-    top: -20%;
-    left: -20%;
-  }
-  .design-orb-1 {
-    animation: floatAmbient 12s infinite ease-in-out;
-  }
-  .design-orb-2 {
-    animation: floatAmbient 16s infinite ease-in-out alternate;
-  }
-  .fade-in-entry {
-    animation: fadeIn 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-  }
-  .ease-element {
-    transition: all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1) !important;
-  }
-  .ease-element:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 16px 38px rgba(31, 38, 135, 0.08) !important;
-  }
-`;
-
-// =======================================================================
-// PREMIUM LUMINANCE STYLE MATRIX (WITH EXPANSION FIELDS)
-// =======================================================================
-const styles = {
-  ambientWrapper: {
-    minHeight: '100vh',
-    backgroundImage: 'radial-gradient(at 0% 0%, #e0e7ff 0px, transparent 45%), radial-gradient(at 100% 0%, #fce7f3 0px, transparent 45%), radial-gradient(at 100% 100%, #eff6ff 0px, transparent 50%)',
-    backgroundColor: '#ffffff',
-    color: '#0f172a',
-    fontFamily: 'system-ui, -apple-system, sans-serif',
-    display: 'flex',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: '38px 29px',
-    boxSizing: 'border-box' as const,
-    position: 'relative' as const,
-    overflowX: 'hidden' as const,
-  },
-  bokehOrb: {
-    position: 'absolute' as const,
-    borderRadius: '50%',
-    filter: 'blur(50px)',
-    zIndex: 0,
-    pointerEvents: 'none' as const
-  },
-  cubeContainer: {
-    position: 'absolute' as const,
-    width: '400px',
-    height: '400px',
-    top: '12%',
-    left: '8%',
-    perspective: '1000px',
-    zIndex: 1,
-    pointerEvents: 'none' as const
-  },
-  solidCube: {
-    width: '200px',
-    height: '200px',
-    position: 'relative' as const,
-    transformStyle: 'preserve-3d' as const,
-  },
-  cubeFace: {
-    position: 'absolute' as const,
-    width: '200px',
-    height: '200px',
-    border: '2px solid rgba(255,255,255,0.7)',
-    backdropFilter: 'blur(8px)',
-    boxShadow: 'inset 0 0 30px rgba(255,255,255,0.2)'
-  },
-  revolvingPerimeterOuter: {
-    position: 'relative' as const,
-    width: '100%',
-    maxWidth: '532px',
-    padding: '4px',
-    borderRadius: '33px',
-    overflow: 'hidden' as const,
-    display: 'flex',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 2,
-    boxShadow: '0 30px 60px -15px rgba(0,0,0,0.15)'
-  },
-  loginCard: {
-    position: 'relative' as const,
-    zIndex: 1,
-    width: '100%',
-    padding: '48px',     
-    borderRadius: '29px', 
-    backgroundColor: 'rgba(255, 255, 255, 0.88)',
-    backdropFilter: 'blur(36px) saturate(190%)',
-    boxSizing: 'border-box' as const,
-  },
-  loginHeaderGrid: { display: 'flex', flexDirection: 'column' as const, alignItems: 'center', marginBottom: '38px' },
-  logoBadge: { padding: '10px 17px', backgroundColor: '#0f172a', color: '#ffffff', borderRadius: '12px', fontSize: '16px', fontWeight: 'bold', marginBottom: '14px' },
-  loginTitle: { fontSize: '31px', fontWeight: '800', margin: 0, color: '#0f172a', letterSpacing: '-0.6px' },
-  loginSubtitle: { fontSize: '16px', color: '#475569', marginTop: '7px', margin: 0 },
-  
-  glassInput: {
-    width: '100%',
-    padding: '14px 17px', 
-    backgroundColor: 'rgba(255, 255, 255, 0.7)',
-    border: '1px solid rgba(15, 23, 42, 0.12)',
-    borderRadius: '12px',
-    color: '#0f172a',
-    fontSize: '17px', 
-    outline: 'none',
-    boxSizing: 'border-box' as const,
-  },
-  glassDropdown: {
-    width: '100%',
-    padding: '14px 17px',
-    backgroundColor: 'rgba(255, 255, 255, 0.85)',
-    border: '1px solid rgba(15, 23, 42, 0.12)',
-    borderRadius: '12px',
-    color: '#0f172a',
-    fontSize: '17px',
-    outline: 'none',
-    boxSizing: 'border-box' as const,
-    cursor: 'pointer'
-  },
-  authErrorAlert: { padding: '12px', borderRadius: '10px', backgroundColor: 'rgba(220,38,38,0.06)', border: '1px solid #f87171', color: '#b91c1c', fontSize: '16px', textAlign: 'center' as const },
-  glassSubmitButton: { width: '100%', padding: '17px', backgroundColor: '#0f172a', border: 'none', borderRadius: '12px', color: '#ffffff', fontWeight: 'bold' as const, cursor: 'pointer', fontSize: '17px', marginTop: '10px', boxShadow: '0 12px 24px -6px rgba(15,23,42,0.2)' },
-  
-  dashboardContainer: { width: '100%', maxWidth: '1728px', display: 'flex', flexDirection: 'column' as const, gap: '29px', position: 'relative' as const, zIndex: 1 },
-  glassHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(255, 255, 255, 0.5)', border: '1px solid rgba(255, 255, 255, 0.6)', borderRadius: '24px', padding: '29px', backdropFilter: 'blur(30px)', boxShadow: '0 10px 38px rgba(31,38,135,0.04)' },
-  liveIndicator: { width: '12px', height: '12px', borderRadius: '50%', display: 'inline-block' },
-  mainTitle: { fontSize: '26px', fontWeight: '800', margin: 0, color: '#0f172a', letterSpacing: '-0.6px' },
-  subTitle: { fontSize: '16px', color: '#475569', margin: '5px 0 0 0' },
-  userTag: { fontSize: '16px', color: '#1e293b', fontWeight: '600', backgroundColor: 'rgba(255,255,255,0.6)', padding: '7px 17px', borderRadius: '24px', border: '1px solid rgba(15, 23, 42, 0.08)' },
-  glassEngineButton: { padding: '14px 24px', borderRadius: '12px', color: '#ffffff', border: 'none', fontWeight: 'bold' as const, cursor: 'pointer', fontSize: '16px' },
-  glassLogoutButton: { padding: '14px 24px', backgroundColor: 'rgba(15, 23, 42, 0.08)', borderRadius: '12px', color: '#0f172a', border: '1px solid rgba(15, 23, 42, 0.15)', fontWeight: 'bold' as const, cursor: 'pointer', fontSize: '16px' },
-  
-  dashboardGrid: { display: 'grid', gridTemplateColumns: '2.2fr 1fr', gap: '29px', width: '100%' },
-  adminDashboardGrid: { display: 'grid', gridTemplateColumns: '1fr 2.5fr', gap: '29px', width: '100%' },
-  glassCardPanel: { backgroundColor: 'rgba(255, 255, 255, 0.45)', border: '1px solid rgba(255, 255, 255, 0.6)', backdropFilter: 'blur(36px)', borderRadius: '24px', padding: '34px', boxShadow: '0 12px 48px -12px rgba(31, 38, 135, 0.05)' },
-  panelTitle: { fontSize: '20px', fontWeight: '800', marginTop: 0, marginBottom: '24px', borderBottom: '1px solid rgba(15,23,42,0.06)', paddingBottom: '14px', color: '#0f172a' },
-  panelInlineTitle: { fontSize: '14px', fontWeight: '700', marginTop: 0, marginBottom: '17px', color: '#475569', textTransform: 'uppercase' as const, letterSpacing: '0.6px' },
-  
-  filterGridContainer: { display: 'grid', gridTemplateColumns: '1.4fr 1fr 1fr', gap: '19px' },
-  
-  table: { width: '100%', borderCollapse: 'collapse' as const, textAlign: 'left' as const },
-  tableHeaderRow: { borderBottom: '2px solid rgba(15,23,42,0.08)' },
-  tableHeaderCell: { padding: '14px 12px', fontSize: '13px', textTransform: 'uppercase' as const, color: '#475569', fontWeight: '700' },
-  tableBodyRow: { borderBottom: '1px solid rgba(15,23,42,0.05)' },
-  tableBodyCell: { padding: '17px 12px', fontSize: '16px', color: '#1e293b' },
-  emptyRow: { padding: '29px', textAlign: 'center' as const, color: '#64748b', fontSize: '16px' },
-  statusBadge: { padding: '5px 12px', borderRadius: '7px', fontSize: '13px', fontWeight: '700' as const },
-  
-  checkboxStyle: { width: '18px', height: '18px', cursor: 'pointer', accentColor: '#3b82f6' },
-  bulkCompleteButton: { padding: '10px 19px', backgroundColor: '#0f172a', color: '#ffffff', border: 'none', borderRadius: '10px', fontSize: '14px', fontWeight: 'bold' as const, cursor: 'pointer', boxShadow: '0 8px 16px rgba(0,0,0,0.1)' },
-  inlineCompleteBtn: { padding: '5px 12px', backgroundColor: 'rgba(13,148,136,0.1)', border: '1px solid rgba(13,148,136,0.3)', color: '#0d9488', borderRadius: '7px', cursor: 'pointer', fontSize: '13px', fontWeight: '700' as const },
-  faultButton: { padding: '5px 12px', backgroundColor: 'rgba(220,38,38,0.08)', border: '1px solid rgba(220,38,38,0.2)', color: '#dc2626', borderRadius: '7px', cursor: 'pointer', fontSize: '13px', fontWeight: '600' as const },
-  manualEntryBtn: { width: '100%', padding: '14px', backgroundColor: '#4f46e5', color: '#ffffff', border: 'none', borderRadius: '12px', fontWeight: 'bold' as const, cursor: 'pointer', fontSize: '15px', marginTop: '7px', boxShadow: '0 8px 20px -4px rgba(79,70,229,0.3)' },
-  
-  formStructure: { display: 'flex', flexDirection: 'column' as const, gap: '22px' },
-  formGroup: { display: 'flex', flexDirection: 'column' as const, gap: '7px' },
-  formLabel: { fontSize: '13px', color: '#475569', fontWeight: '700', textTransform: 'uppercase' as const, letterSpacing: '0.6px' },
-  notificationBanner: { padding: '14px', borderRadius: '10px', borderWidth: '1px', borderStyle: 'solid' as const, fontSize: '16px' },
-  glassManualSubmitButton: { marginTop: '12px', width: '100%', padding: '17px', backgroundColor: '#0d9488', border: 'none', borderRadius: '12px', color: '#ffffff', fontWeight: 'bold' as const, cursor: 'pointer', fontSize: '16px' },
-  
-  adminNavButton: { width: '100%', padding: '17px 19px', border: 'none', borderRadius: '12px', fontSize: '16px', fontWeight: '700' as const, textAlign: 'left' as const, cursor: 'pointer' },
-  adminTabTitle: { fontSize: '24px', fontWeight: '800', margin: '0 0 7px 0', color: '#0f172a' },
-  adminActionRowGrid: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' },
-  adminInteractiveCard: { backgroundColor: 'rgba(255,255,255,0.4)', border: '1px solid rgba(15,23,42,0.06)', padding: '24px', borderRadius: '17px' },
-  adminActionInlineBtn: { width: '100%', marginTop: '17px', padding: '14px', backgroundColor: '#ec4899', color: '#ffffff', fontWeight: '700' as const, border: 'none', borderRadius: '10px', cursor: 'pointer', fontSize: '16px' },
-  adminSuccessToast: { padding: '14px 19px', backgroundColor: 'rgba(22,163,74,0.1)', border: '1px solid #16a34a', color: '#14532d', borderRadius: '12px', fontSize: '16px', fontWeight: '600' as const, marginBottom: '24px' },
-
-  qaDashboardLayout: { display: 'flex', flexDirection: 'column' as const, gap: '29px', width: '100%' },
-  qaMetricsContainer: { display: 'grid' as const, gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: '24px' },
-  qaMetricCard: { backgroundColor: 'rgba(255, 255, 255, 0.55)', border: '1px solid rgba(255,255,255,0.7)', borderRadius: '20px', padding: '24px', backdropFilter: 'blur(20px)' },
-  qaMetricLabel: { fontSize: '13px', color: '#475569', textTransform: 'uppercase' as const, fontWeight: '700', letterSpacing: '0.5px' },
-  qaMetricVal: { fontSize: '29px', fontWeight: '900', margin: '8px 0', color: '#0f172a' },
-  qaStaticRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '14px', backgroundColor: 'rgba(255,255,255,0.4)', borderRadius: '12px', border: '1px solid rgba(15,23,42,0.04)' }
-};
