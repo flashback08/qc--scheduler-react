@@ -1,27 +1,47 @@
 'use client';
-import React from 'react';
+import React, { useState } from 'react';
 import { Analyst } from '@/lib/supabase';
 
 interface RosterControlProps {
   analysts: Analyst[];
-  isDarkMode: boolean;
+  onAdd: (name: string, section: string) => void;
+  onDelete: (code: string) => void;
   onToggle: (code: string, status: boolean) => void;
+  isDarkMode: boolean;
 }
 
-export default function RosterControl({ analysts, isDarkMode, onToggle }: RosterControlProps) {
+export default function RosterControl({ analysts, onAdd, onDelete, onToggle, isDarkMode }: RosterControlProps) {
+  const [newName, setNewName] = useState('');
+
+  const handleDelete = (code: string) => {
+    if (confirm("⚠️ WARNING: This will permanently delete the analyst record and all associated history from this view. Are you sure?")) {
+      onDelete(code);
+    }
+  };
+
   return (
-    <div className="space-y-3">
-      <h4 className="text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-400">👥 Team Member Availability Flags</h4>
-      <div className="max-h-[160px] overflow-y-auto space-y-2 pr-1 custom-scrollbar">
+    <div className="space-y-4">
+      <h4 className="text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-400">👥 Analyst Roster Management</h4>
+      
+      {/* Add New Analyst */}
+      <div className="flex gap-2">
+        <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Full Name" className="flex-1 p-2 text-sm rounded border bg-transparent" />
+        <button onClick={() => { onAdd(newName, 'RM'); setNewName('') }} className="px-3 py-1 bg-purple-600 text-white rounded text-xs">ADD</button>
+      </div>
+
+      <div className="max-h-[200px] overflow-y-auto space-y-2">
         {analysts.map((a) => (
-          <div key={a.employee_code} className={`flex items-center justify-between p-3 border rounded-xl text-xs font-mono ${isDarkMode ? 'bg-black/30 border-white/[0.04]' : 'bg-slate-100 border-slate-300'}`}>
+          <div key={a.employee_code} className="flex items-center justify-between p-3 border rounded-xl text-xs">
             <div>
-              <span className={`font-bold font-sans block text-sm ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>{a.full_name}</span>
-              <span className="text-slate-500 font-semibold">ID Reference Code: {a.employee_code}</span>
+              <span className="font-bold block">{a.full_name}</span>
+              <span className="text-slate-500">{a.employee_code}</span>
             </div>
-            <button type="button" onClick={() => onToggle(a.employee_code, a.is_available_today)} className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider border ${a.is_available_today ? 'bg-emerald-500/10 text-emerald-600 border-emerald-500/20' : 'bg-red-500/10 text-red-500 border-red-500/20'}`}>
-              {a.is_available_today ? '🟢 On Shift' : '🔴 Off Shift'}
-            </button>
+            <div className="flex gap-2">
+              <button onClick={() => onToggle(a.employee_code, a.is_available_today)} className={`px-2 py-1 rounded ${a.is_available_today ? 'bg-emerald-500/10' : 'bg-red-500/10'}`}>
+                {a.is_available_today ? 'ON' : 'OFF'}
+              </button>
+              <button onClick={() => handleDelete(a.employee_code)} className="px-2 py-1 bg-red-600 text-white rounded">DELETE</button>
+            </div>
           </div>
         ))}
       </div>
